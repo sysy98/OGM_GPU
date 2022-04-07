@@ -9,8 +9,9 @@
 __constant__ GridInfo dev_grid_info[1];
 __constant__ MapSize dev_map_size[1];
 
-thrust::device_vector<float> thrust_bins_distance;
-
+float *bins_distance;
+int *cart_cell_polar_id;
+int device;
 
 template<typename value_type, typename matrix_type = value_type *, typename vector_type = value_type *>
 struct MatVecMul {
@@ -109,22 +110,46 @@ LidarOgmCuda::LidarOgmCuda(int NUM_THREADS,
           inv_radial_res_(map_params.grid_info_.inv_radial_res),
           inv_angular_res_(map_params.grid_info_.inv_angular_res) {
 
+    device = -1;
+    cudaGetDevice(&device);
+
+    int max_num_points_per_seg = ceil(360.0 / grid_segments_ / 0.174) * 64;
+    // std::cout << "Max num points per seg: " << max_num_points_per_seg << "\n";
+
     cudaMemcpyToSymbol(dev_grid_info, &(map_params.grid_info_), sizeof(GridInfo));
     cudaMemcpyToSymbol(dev_map_size, &(map_params.map_size_), sizeof(MapSize));
 
-    thrust::host_vector<float> h_bins_distance(grid_bins_);
+    cudaMallocManaged((void **) &bins_distance, grid_bins_ * sizeof(float));
     
     for(int b = 0; b < grid_bins_; b++){    
         // Calculate distance between each cell and the origin of lidar.
-        h_bins_distance[b] = float(b) / inv_radial_res_ + grid_cell_size_ / 2;
+        bins_distance[b] = float(b) / inv_radial_res_ + grid_cell_size_ / 2;
     }
+
+    cudaMallocManaged((void**) &cart_cell_polar_id, width_grid_ * height_grid_ * sizeof(int));
     
-    thrust_bins_distance = h_bins_distance;
-    int max_num_points_per_seg = ceil(360.0 / grid_segments_ / 0.174) * 64;
-    std::cout << "Max num points per seg: " << max_num_points_per_seg << "\n";
+    for(int w = 0; w < width_grid_; w++){
+        for(int h = 0; h < height_grid_; h++){
+    
+            int local_cart_id = w + h * width_grid_;
+            double velo_x, velo_y, velo_distance;
+            velo_x = -grid_range_max_ + grid_cell_size_ * (0.5 + h);
+            velo_y = -grid_range_max_ + grid_cell_size_ * (0.5 + w);
+            velo_distance = sqrt(velo_x * velo_x + velo_y * velo_y);
+
+            float ang = std::atan2(velo_x, velo_y);
+            int seg = int((ang + M_PI) * inv_angular_res_);
+            int bin = int(velo_distance * inv_radial_res_);
+            
+            cart_cell_polar_id[local_cart_id] = seg * grid_bins_ + bin;
+        }
+    }
 }
 
-LidarOgmCuda::~LidarOgmCuda() = default;
+LidarOgmCuda::~LidarOgmCuda(){
+    GPU_CHECK(cudaFree(bins_distance));
+    GPU_CHECK(cudaFree(cart_cell_polar_id));
+}
 
 void LidarOgmCuda::processPointsCuda(VPointCloud::Ptr &pcl_in_,
                                      float *tf_array,
@@ -132,13 +157,11 @@ void LidarOgmCuda::processPointsCuda(VPointCloud::Ptr &pcl_in_,
                                      int *h_ogm_data_array) {
 
     points_num = (int) pcl_in_->size();
-    float *host_points_array;
+    float *points_array;
 
-    GPU_CHECK(cudaHostAlloc((void **) &host_points_array,
-                            points_num * 3 * sizeof(float),
-                            cudaHostAllocDefault));
+    cudaMallocManaged((void **) &points_array, points_num * 3 * sizeof(float));
 
-    thrust::device_vector<float> thrust_points(points_num * 3);
+    pclToVector(pcl_in_, points_array);
 
     // transfer tf array to device
     thrust::device_vector<float> thrust_tf_array(tf_array, tf_array + 16);
@@ -157,17 +180,10 @@ void LidarOgmCuda::processPointsCuda(VPointCloud::Ptr &pcl_in_,
     cudaStreamCreate(&s1);
     cudaStreamCreate(&s2);
 
-    pclToHostVector(pcl_in_, host_points_array);
-
-    // transfer points array to device
-    cudaMemcpyAsync(thrust::raw_pointer_cast(thrust_points.data()),
-                    host_points_array,
-                    points_num * 3 * sizeof(float), cudaMemcpyHostToDevice, s1);
-
     // copy global cartesian probability array of the previous frame to device
     cudaMemcpyAsync(thrust::raw_pointer_cast(thrust_global_cells_prob_array.data()),
                     h_global_cells_prob_array,
-                    occ_grid_num_ * sizeof(float), cudaMemcpyHostToDevice, s2);
+                    occ_grid_num_ * sizeof(float), cudaMemcpyHostToDevice, s1);
     
     // copy ogm data array of the previous frame to device
     cudaMemcpyAsync(thrust::raw_pointer_cast(thrust_ogm_data_array.data()),
@@ -177,24 +193,33 @@ void LidarOgmCuda::processPointsCuda(VPointCloud::Ptr &pcl_in_,
     // wait for the stream s2 to finish
     cudaStreamSynchronize(s2);
 
+    cudaMemPrefetchAsync(points_array, grid_bins_*sizeof(float), device, s1);
+
     int num_block = DIVUP(points_num, NUM_THREADS_);
 
     mark_elevated_cell_kernel<<<num_block, NUM_THREADS_, 0, s1>>>(
         points_num,
         max_num_points_per_seg,
-        thrust::raw_pointer_cast(thrust_points.data()),
+        points_array,
         thrust::raw_pointer_cast(thrust_points_in_seg_count.data()),
         thrust::raw_pointer_cast(thrust_point_distance_in_segs.data()) );
+
+    cudaDeviceSynchronize();
+
+    cudaMemPrefetchAsync(bins_distance, points_num * 3 * sizeof(float), device, s1);
 
     update_cell_probs_kernel<<<grid_segments_, grid_bins_, 0, s1>>>(
         points_num,
         max_num_points_per_seg,
         thrust::raw_pointer_cast(thrust_points_in_seg_count.data()),
         thrust::raw_pointer_cast(thrust_point_distance_in_segs.data()),
-        thrust::raw_pointer_cast(thrust_bins_distance.data()),
+        bins_distance,
         thrust::raw_pointer_cast(thrust_p_logit.data()) );
     
+    cudaDeviceSynchronize();
+
     map_polar_to_cartesian_ogm_kernel<<<width_grid_, height_grid_, 0, s1>>>(
+        cart_cell_polar_id,
         thrust::raw_pointer_cast(thrust_tf_array.data()),
         thrust::raw_pointer_cast(thrust_global_cells_prob_array.data()),
         thrust::raw_pointer_cast(thrust_ogm_data_array.data()),
@@ -218,18 +243,18 @@ void LidarOgmCuda::processPointsCuda(VPointCloud::Ptr &pcl_in_,
     cudaStreamDestroy(s1);
     cudaStreamDestroy(s2);
 
-    GPU_CHECK(cudaFreeHost(host_points_array));
+    GPU_CHECK(cudaFree(points_array));
 }
 
-void LidarOgmCuda::pclToHostVector(VPointCloud::Ptr &pcl_in_,
-                                   float *host_points_array) const {
+void LidarOgmCuda::pclToVector(VPointCloud::Ptr &pcl_in_,
+                                   float *points_array) const {
     // transform point cloud to 1d vector
     for (int i = 0; i < points_num; ++i) {
 
         VPoint point = pcl_in_->at(i);
-        host_points_array[i * 3 + 0] = point.x;
-        host_points_array[i * 3 + 1] = point.y;
-        host_points_array[i * 3 + 2] = point.z;
+        points_array[i * 3 + 0] = point.x;
+        points_array[i * 3 + 1] = point.y;
+        points_array[i * 3 + 2] = point.z;
     }
 }
 
@@ -265,7 +290,7 @@ __global__ void update_cell_probs_kernel(int points_num,
                                          const int max_num_points_per_seg,   
                                          const int *dev_points_in_seg_count,
                                          float *dev_point_distance_in_segs,
-                                         float *dev_bins_distance, 
+                                         float *bins_distance, 
                                          float *dev_p_logit) {
     int seg = blockIdx.x;
     int bin = threadIdx.x;
@@ -277,7 +302,7 @@ __global__ void update_cell_probs_kernel(int points_num,
     if(count > 0){
         float lo_up{log(0.96/ 0.04)};
         float lo_low{log(0.01 / 0.99)};
-        const float bin_distance = dev_bins_distance[bin];
+        const float bin_distance = bins_distance[bin];
         
         float temp_init_free_p = 0.4;
         float temp_occ_p = 0.0;
@@ -315,7 +340,8 @@ __global__ void update_cell_probs_kernel(int points_num,
 }
 
 
-__global__ void map_polar_to_cartesian_ogm_kernel(float *dev_tf_array, 
+__global__ void map_polar_to_cartesian_ogm_kernel(int *cart_cell_polar_id,
+                                                  float *dev_tf_array, 
                                                   float *dev_cells_prob,
                                                   int *dev_ogm_data_array, 
                                                   const float *dev_p_logit) {
@@ -326,18 +352,16 @@ __global__ void map_polar_to_cartesian_ogm_kernel(float *dev_tf_array,
     if ( w < dev_map_size[0].width_grid && h < dev_map_size[0].height_grid){
         float lo_up{log(0.99 / 0.01)};
         float lo_low{log(0.04 / 0.96)};
-            
-        float velo_y = -dev_grid_info[0].grid_range_max + dev_grid_info[0].grid_cell_size * (0.5 + w);
-        float velo_x = -dev_grid_info[0].grid_range_max + dev_grid_info[0].grid_cell_size * (0.5 + h);
-        float velo_distance = sqrt(velo_x * velo_x + velo_y * velo_y);
-
-        int seg, bin, polar_id;
-        fromVeloCoordsToPolarCell(velo_x, velo_y, velo_distance, seg, bin, polar_id);
 
         int final_cartesian_id = fromLocalOgmToFinalOgm(int(h), int(w), dev_tf_array);
 
+        // Find the index of the corresponding polar cell.
+        int polar_id = cart_cell_polar_id[w + h * dev_map_size[0].width_grid];
+
         float cell_lo_past = dev_cells_prob[final_cartesian_id];
+
         float final_lo = fmax(lo_low, fmin(lo_up, cell_lo_past + dev_p_logit[polar_id]));
+
         dev_cells_prob[final_cartesian_id] = final_lo;
 
         if (fabs(final_lo) <= 1e-5)

@@ -47,7 +47,7 @@ SensorProcessing::SensorProcessing(ros::NodeHandle nh,
                                                                         NUM_THREADS_(256)
 {
     // Get scenario parameter
-    int scenario = 0;
+    int scenario = 11;
     std::ostringstream scenario_stream;
     scenario_stream << std::setfill('0') << std::setw(4) << scenario;
     scenario_str = scenario_stream.str();
