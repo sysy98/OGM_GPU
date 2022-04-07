@@ -9,8 +9,8 @@
 __constant__ GridInfo dev_grid_info[1];
 __constant__ MapSize dev_map_size[1];
 
-float *h_bins_distance;
-float *d_bins_distance;
+thrust::device_vector<float> thrust_bins_distance;
+
 
 template<typename value_type, typename matrix_type = value_type *, typename vector_type = value_type *>
 struct MatVecMul {
@@ -109,27 +109,22 @@ LidarOgmCuda::LidarOgmCuda(int NUM_THREADS,
           inv_radial_res_(map_params.grid_info_.inv_radial_res),
           inv_angular_res_(map_params.grid_info_.inv_angular_res) {
 
-    int max_num_points_per_seg = ceil(360.0 / grid_segments_ / 0.174) * 64;
-    std::cout << "Max num points per seg: " << max_num_points_per_seg << "\n";
-
     cudaMemcpyToSymbol(dev_grid_info, &(map_params.grid_info_), sizeof(GridInfo));
     cudaMemcpyToSymbol(dev_map_size, &(map_params.map_size_), sizeof(MapSize));
 
-    GPU_CHECK(cudaHostAlloc((void **) &h_bins_distance,
-                            grid_bins_ * sizeof(float),
-                            cudaHostAllocMapped));
+    thrust::host_vector<float> h_bins_distance(grid_bins_);
     
     for(int b = 0; b < grid_bins_; b++){    
         // Calculate distance between each cell and the origin of lidar.
         h_bins_distance[b] = float(b) / inv_radial_res_ + grid_cell_size_ / 2;
     }
     
-    GPU_CHECK(cudaHostGetDevicePointer((void**)&d_bins_distance, (void*)h_bins_distance, 0));
+    thrust_bins_distance = h_bins_distance;
+    int max_num_points_per_seg = ceil(360.0 / grid_segments_ / 0.174) * 64;
+    std::cout << "Max num points per seg: " << max_num_points_per_seg << "\n";
 }
 
-LidarOgmCuda::~LidarOgmCuda(){
-    GPU_CHECK(cudaFreeHost(h_bins_distance));
-}
+LidarOgmCuda::~LidarOgmCuda() = default;
 
 void LidarOgmCuda::processPointsCuda(VPointCloud::Ptr &pcl_in_,
                                      float *tf_array,
@@ -137,21 +132,13 @@ void LidarOgmCuda::processPointsCuda(VPointCloud::Ptr &pcl_in_,
                                      int *h_ogm_data_array) {
 
     points_num = (int) pcl_in_->size();
-    float *h_points_array, *d_points_array;
+    float *host_points_array;
 
-    GPU_CHECK(cudaHostAlloc((void **) &h_points_array,
+    GPU_CHECK(cudaHostAlloc((void **) &host_points_array,
                             points_num * 3 * sizeof(float),
-                            cudaHostAllocMapped));
-    pclToHostVector(pcl_in_, h_points_array);
+                            cudaHostAllocDefault));
 
-    // transfer points array to device
-    cudaHostGetDevicePointer((void**)&d_points_array, (void*)h_points_array, 0);
-
-    float *d_global_cells_probs_array;
-    int *d_ogm_data_array;
-
-    cudaHostGetDevicePointer((void**)&d_global_cells_probs_array, (void*)h_global_cells_prob_array, 0);
-    cudaHostGetDevicePointer((void**)&d_ogm_data_array, (void*)h_ogm_data_array, 0);
+    thrust::device_vector<float> thrust_points(points_num * 3);
 
     // transfer tf array to device
     thrust::device_vector<float> thrust_tf_array(tf_array, tf_array + 16);
@@ -162,48 +149,87 @@ void LidarOgmCuda::processPointsCuda(VPointCloud::Ptr &pcl_in_,
 
     thrust::device_vector<float> thrust_p_logit(polar_grid_num_, 0.0);
 
+    thrust::device_vector<float> thrust_global_cells_prob_array(occ_grid_num_);
+    thrust::device_vector<int> thrust_ogm_data_array(occ_grid_num_);
+
+    // create CUDA streams
+    cudaStream_t s1, s2;
+    cudaStreamCreate(&s1);
+    cudaStreamCreate(&s2);
+
+    pclToHostVector(pcl_in_, host_points_array);
+
+    // transfer points array to device
+    cudaMemcpyAsync(thrust::raw_pointer_cast(thrust_points.data()),
+                    host_points_array,
+                    points_num * 3 * sizeof(float), cudaMemcpyHostToDevice, s1);
+
+    // copy global cartesian probability array of the previous frame to device
+    cudaMemcpyAsync(thrust::raw_pointer_cast(thrust_global_cells_prob_array.data()),
+                    h_global_cells_prob_array,
+                    occ_grid_num_ * sizeof(float), cudaMemcpyHostToDevice, s2);
     
+    // copy ogm data array of the previous frame to device
+    cudaMemcpyAsync(thrust::raw_pointer_cast(thrust_ogm_data_array.data()),
+                    h_ogm_data_array,
+                    occ_grid_num_ * sizeof(int), cudaMemcpyHostToDevice, s2);
+    
+    // wait for the stream s2 to finish
+    cudaStreamSynchronize(s2);
+
     int num_block = DIVUP(points_num, NUM_THREADS_);
 
-    mark_elevated_cell_kernel<<<num_block, NUM_THREADS_>>>(
+    mark_elevated_cell_kernel<<<num_block, NUM_THREADS_, 0, s1>>>(
         points_num,
         max_num_points_per_seg,
-        d_points_array,
+        thrust::raw_pointer_cast(thrust_points.data()),
         thrust::raw_pointer_cast(thrust_points_in_seg_count.data()),
         thrust::raw_pointer_cast(thrust_point_distance_in_segs.data()) );
 
-    cudaDeviceSynchronize();
-
-    update_cell_probs_kernel<<<grid_segments_, grid_bins_>>>(
+    update_cell_probs_kernel<<<grid_segments_, grid_bins_, 0, s1>>>(
         points_num,
         max_num_points_per_seg,
         thrust::raw_pointer_cast(thrust_points_in_seg_count.data()),
         thrust::raw_pointer_cast(thrust_point_distance_in_segs.data()),
-        d_bins_distance,
+        thrust::raw_pointer_cast(thrust_bins_distance.data()),
         thrust::raw_pointer_cast(thrust_p_logit.data()) );
     
-    cudaDeviceSynchronize();
-
-    map_polar_to_cartesian_ogm_kernel<<<width_grid_, height_grid_>>>(
+    map_polar_to_cartesian_ogm_kernel<<<width_grid_, height_grid_, 0, s1>>>(
         thrust::raw_pointer_cast(thrust_tf_array.data()),
-        d_global_cells_probs_array,
-        d_ogm_data_array,
+        thrust::raw_pointer_cast(thrust_global_cells_prob_array.data()),
+        thrust::raw_pointer_cast(thrust_ogm_data_array.data()),
         thrust::raw_pointer_cast(thrust_p_logit.data()));
 
-    cudaDeviceSynchronize();
+    // wait for all kernel functions to finish
+    cudaStreamSynchronize(s1);
 
-    GPU_CHECK(cudaFreeHost(h_points_array));
+    cudaMemcpyAsync(h_ogm_data_array,
+                    thrust::raw_pointer_cast(thrust_ogm_data_array.data()),
+                    occ_grid_num_ * sizeof(int), cudaMemcpyDeviceToHost, s2);
+    
+    cudaMemcpyAsync(h_global_cells_prob_array,
+                    thrust::raw_pointer_cast(thrust_global_cells_prob_array.data()),
+                    occ_grid_num_ * sizeof(float), cudaMemcpyDeviceToHost, s1);
+    
+    // wait for streams to finish
+    cudaStreamSynchronize(s1);
+    cudaStreamSynchronize(s2);
+
+    cudaStreamDestroy(s1);
+    cudaStreamDestroy(s2);
+
+    GPU_CHECK(cudaFreeHost(host_points_array));
 }
 
 void LidarOgmCuda::pclToHostVector(VPointCloud::Ptr &pcl_in_,
-                                   float *h_points_array) const {
+                                   float *host_points_array) const {
     // transform point cloud to 1d vector
     for (int i = 0; i < points_num; ++i) {
 
         VPoint point = pcl_in_->at(i);
-        h_points_array[i * 3 + 0] = point.x;
-        h_points_array[i * 3 + 1] = point.y;
-        h_points_array[i * 3 + 2] = point.z;
+        host_points_array[i * 3 + 0] = point.x;
+        host_points_array[i * 3 + 1] = point.y;
+        host_points_array[i * 3 + 2] = point.z;
     }
 }
 

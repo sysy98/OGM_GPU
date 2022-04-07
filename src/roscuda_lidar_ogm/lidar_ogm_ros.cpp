@@ -38,7 +38,7 @@ SensorProcessing::SensorProcessing(ros::NodeHandle nh,
                                                                         pcl_elevated_(new VPointCloud),
                                                                         cloud_sub_(nh, "/kitti/velo/pointcloud", 10),
                                                                         tf_listener_(buffer_),
-                                                                         /*Scenario 0*/
+                                                                        /*Scenario 0*/
                                                                         // width_gain_(2),
                                                                         // height_gain_(1.8),
                                                                         /*Scenario 1 and 2*/
@@ -116,11 +116,11 @@ SensorProcessing::SensorProcessing(ros::NodeHandle nh,
 
     GPU_CHECK(cudaHostAlloc((void **)&h_global_cells_prob_array,
                             map_size_.occ_grid_num * sizeof(float),
-                            cudaHostAllocMapped)); // 1
+                            cudaHostAllocDefault)); // 1
 
     GPU_CHECK(cudaHostAlloc((void **)&h_ogm_data_array,
                             map_size_.occ_grid_num * sizeof(int),
-                            cudaHostAllocMapped)); // -1
+                            cudaHostAllocDefault)); // -1
 
     // Init cell probability in the global cartesian map
     for (int i = 0; i < map_size_.occ_grid_num; i++)
