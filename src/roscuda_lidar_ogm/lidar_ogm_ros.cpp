@@ -47,11 +47,11 @@ SensorProcessing::SensorProcessing(ros::NodeHandle nh,
                                                                         NUM_THREADS_(256)
 {
     // Get scenario parameter
-    int scenario = 11;
+    int scenario = 0;
     std::ostringstream scenario_stream;
     scenario_stream << std::setfill('0') << std::setw(4) << scenario;
     scenario_str = scenario_stream.str();
- 
+
     // Define lidar parameters
     private_nh_.param<float>("lidar/height", lidar_height, -1.73);
     private_nh_.param<float>("lidar/z_min", params_.lidar_z_min, -2.4);
@@ -137,7 +137,7 @@ SensorProcessing::SensorProcessing(ros::NodeHandle nh,
     vehicle_pos_pub_ = nh_.advertise<PointStamped>(
         "/vehicle_pose", 2);
     // pcl_elevated_pub_ = nh_.advertise<sensor_msgs::PointCloud2>(
-	// 	"/pointcloud/elevated", 2);
+    // 	"/pointcloud/elevated", 2);
 
     // Define Subscriber
     cloud_sub_.registerCallback(boost::bind(&SensorProcessing::process, this, _1));
@@ -151,9 +151,9 @@ SensorProcessing::~SensorProcessing()
 
 void SensorProcessing::process(
     const sensor_msgs::PointCloud2::ConstPtr &cloud)
-{   
+{
     cloud_stamp_ = cloud->header.stamp;
-    
+
     auto startPost = std::chrono::high_resolution_clock::now();
 
     calculateTransMatrix();
@@ -198,7 +198,7 @@ void SensorProcessing::processPointCloud(const sensor_msgs::PointCloud2::ConstPt
 
         // Determine range of lidar point and check
         float range = std::sqrt(point.x * point.x + point.y * point.y);
-        
+
         if (range > grid_info_.grid_range_min &&
             range < grid_info_.grid_range_max * 1.50)
         {
