@@ -1,0 +1,16 @@
+grid:
+  range:
+    min: 2.0
+    max: 80.0
+  cell:
+    size: 0.25
+    height: 0.25
+  segments: 1040
+
+ransac:
+  tolerance: 0.2
+  iterations: 50
+
+lidar:
+  height: -1.73
+  z_min: -2.4
