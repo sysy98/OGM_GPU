@@ -50,11 +50,13 @@ roslaunch roscuda_lidar_ogm roscuda_lidar_ogm.launch
 ```
 
 ## Pipeline and branches
+<div align=center><img src="./pipeline.png" width="600" alt="Pipeline for GPU-accelerated Occupancy Grid Mapping" /></div>
 
-![image](https://github.com/sysy98/OGM_GPU/blob/master/pipeline.png)
 
 The GPU implementation of occupancy grid mapping is illustrated by the following figure.
-![image](https://github.com/sysy98/OGM_GPU/blob/master/GPU_implement.png)
+
+<div align=center><img src="./GPU_implement.png" width="800" alt="GPU Implementation" /></div>
+
 
 ### branches: 
 
