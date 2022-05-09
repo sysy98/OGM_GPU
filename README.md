@@ -2,10 +2,9 @@
 ## Introduction
 Occupancy grid mapping, as one of the most popular methods for constructing environment maps, 
 is widely used for a variety of robotic tasks in the context of autonomous driving.
-
 Therefore, it is necessary to implement this algorithm quickly and efficiently.
 
-This repo is a `ROS` package that leverages GPU parallelism to accelerate occupancy grid mapping with LiDAR point clouds in the `CUDA` framework.
+This repository is a `ROS` package that leverages GPU parallelism to accelerate occupancy grid mapping with LiDAR point clouds in the `CUDA` framework.
 
 ## Visualize Results in Rviz
 <p align="center">
