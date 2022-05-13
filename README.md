@@ -8,11 +8,11 @@ This repository is a `ROS` package that leverages GPU parallelism to accelerate 
 
 ## Visualize Results in Rviz
 <p align="center">
-  <img src="./videos/semantic.gif">
+  <img src="./video_results/0.gif">
 </p>
 
 <p align="center">
-  <img src="./videos/rviz.gif">
+  <img src="./video_results/1.gif">
 </p>
 
 ## Setup
